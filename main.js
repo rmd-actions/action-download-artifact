@@ -1,33 +1,13 @@
 import * as core from '@actions/core'
 import * as exec from '@actions/exec'
 import * as github from '@actions/github'
+import { defaults as githubDefaults } from '@actions/github/lib/utils'
 import * as artifact from '@actions/artifact'
 import AdmZip from 'adm-zip'
-import { filesize } from 'filesize'
+import { randomUUID } from 'node:crypto'
 import pathname from 'node:path'
 import fs from 'node:fs'
-
-async function downloadAction(name, path) {
-    const artifactClient = artifact.create()
-    const downloadOptions = {
-        createArtifactFolder: false
-    }
-    const downloadResponse = await artifactClient.downloadArtifact(
-        name,
-        path,
-        downloadOptions
-    )
-    core.setOutput("found_artifact", true)
-}
-
-async function getWorkflow(client, owner, repo, runID) {
-    const run = await client.rest.actions.getWorkflowRun({
-        owner: owner,
-        repo: repo,
-        run_id: runID || github.context.runId,
-    })
-    return run.data.workflow_id
-}
+import { pipeline } from 'node:stream/promises'
 
 async function main() {
     try {
@@ -56,13 +36,21 @@ async function main() {
         let dryRun = core.getInput("dry_run")
 
         const client = github.getOctokit(token)
+        const artifactClient = new artifact.DefaultArtifactClient()
+        const hostname = new URL(github.context.serverUrl).hostname.toUpperCase()
+        const canStreamArtifacts = hostname === "GITHUB.COM" || hostname.endsWith(".GHE.COM") || hostname.endsWith(".LOCALHOST")
+        const matchesName = artifact => nameIsRegExp ? artifact.name.match(name) !== null : artifact.name == name
 
         core.info(`==> Repository: ${owner}/${repo}`)
         core.info(`==> Artifact name: ${name}`)
         core.info(`==> Local path: ${path}`)
 
         if (!workflow && !workflowSearch) {
-            workflow = await getWorkflow(client, owner, repo, runID)
+            workflow = (await client.rest.actions.getWorkflowRun({
+                owner: owner,
+                repo: repo,
+                run_id: runID || github.context.runId,
+            })).data.workflow_id
         }
 
         if (workflow) {
@@ -70,22 +58,10 @@ async function main() {
         }
         core.info(`==> Workflow conclusion: ${workflowConclusion}`)
 
-        const uniqueInputSets = [
-            {
-                "pr": pr,
-                "commit": commit,
-                "branch": branch,
-                "ref": ref,
-                "run_id": runID
-            }
-        ]
-        uniqueInputSets.forEach((inputSet) => {
-            const inputs = Object.values(inputSet)
-            const providedInputs = inputs.filter(input => input !== '')
-            if (providedInputs.length > 1) {
-                throw new Error(`The following inputs cannot be used together: ${Object.keys(inputSet).join(", ")}`)
-            }
-        })
+        const exclusiveInputs = { pr, commit, branch, ref, "run_id": runID }
+        if (Object.values(exclusiveInputs).filter(Boolean).length > 1) {
+            throw new Error(`The following inputs cannot be used together: ${Object.keys(exclusiveInputs).join(", ")}`)
+        }
 
         if (pr) {
             core.info(`==> PR: ${pr}`)
@@ -95,21 +71,25 @@ async function main() {
                 pull_number: pr,
             })
             commit = pull.data.head.sha
-            //branch = pull.data.head.ref
         }
 
         if (ref) {
             // Try to determine if the ref is a branch or a commit
             core.info(`==> Ref: ${ref}`)
             try {
-                const response = await client.rest.repos.getBranch({
+                await client.rest.repos.getBranch({
                     owner: owner,
                     repo: repo,
                     branch: ref,
                 })
                 branch = ref
             } catch (error) {
-                commit = ref
+                const response = await client.rest.repos.getCommit({
+                    owner: owner,
+                    repo: repo,
+                    ref: ref,
+                })
+                commit = response.data.sha
             }
         }
 
@@ -148,7 +128,7 @@ async function main() {
                     if (runNumber && run.run_number != runNumber) {
                         continue
                     }
-                    if (workflowConclusion && (workflowConclusion != run.conclusion && workflowConclusion != run.status)) {
+                    if (workflowConclusion && workflowConclusion != run.conclusion && workflowConclusion != run.status) {
                         continue
                     }
                     if (!allowForks && run.head_repository.full_name !== `${owner}/${repo}`) {
@@ -156,25 +136,12 @@ async function main() {
                         continue
                     }
                     if (checkArtifacts || searchArtifacts) {
-                        let artifacts = await client.paginate(client.rest.actions.listWorkflowRunArtifacts, {
+                        const artifacts = await client.paginate(client.rest.actions.listWorkflowRunArtifacts, {
                             owner: owner,
                             repo: repo,
                             run_id: run.id,
                         })
-                        if (!artifacts || artifacts.length == 0) {
-                            continue
-                        }
-                        if (searchArtifacts) {
-                            const artifact = artifacts.find((artifact) => {
-                                if (nameIsRegExp) {
-                                    return artifact.name.match(name) !== null
-                                }
-                                return artifact.name == name
-                            })
-                            if (!artifact) {
-                                continue
-                            }
-                        }
+                        if (artifacts.length === 0 || (searchArtifacts && !artifacts.some(matchesName))) continue
                     }
 
                     runID = run.id
@@ -182,7 +149,7 @@ async function main() {
                     core.info(`==> (found) Run date: ${run.created_at}`)
 
                     if (!workflow) {
-                        workflow = await getWorkflow(client, owner, repo, runID)
+                        workflow = run.workflow_id
                         core.info(`==> (found) Workflow: ${workflow}`)
                     }
                     break
@@ -197,12 +164,8 @@ async function main() {
             if (workflowConclusion && (workflowConclusion != 'in_progress')) {
                 return setExitMessage(ifNoArtifactFound, "no matching workflow run found with any artifacts?")
             }
-
-            try {
-                return await downloadAction(name, path)
-            } catch (error) {
-                return setExitMessage(ifNoArtifactFound, "no matching artifact in this workflow?")
-            }
+            runID = github.context.runId
+            core.info(`==> (current) Run ID: ${runID}`)
         }
 
         let artifacts = await client.paginate(client.rest.actions.listWorkflowRunArtifacts, {
@@ -213,12 +176,7 @@ async function main() {
 
         // One artifact if 'name' input is specified, one or more if `name` is a regular expression, all otherwise.
         if (name) {
-            const filtered = artifacts.filter((artifact) => {
-                if (nameIsRegExp) {
-                    return artifact.name.match(name) !== null
-                }
-                return artifact.name == name
-            })
+            const filtered = artifacts.filter(matchesName)
             if (filtered.length == 0) {
                 core.info(`==> (not found) Artifact: ${name}`)
                 core.info('==> Found the following artifacts instead:')
@@ -234,82 +192,150 @@ async function main() {
         core.setOutput("artifacts", artifacts)
 
         if (dryRun) {
-            if (artifacts.length == 0) {
-                core.setOutput("dry_run", false)
-                core.setOutput("found_artifact", false)
-                return
-            } else {
-                core.setOutput("dry_run", true)
-                core.setOutput("found_artifact", true)
-                core.info('==> (found) Artifacts')
-                for (const artifact of artifacts) {
-                    const size = filesize(artifact.size_in_bytes, { base: 10 })
-                    core.info(`\t==> Artifact:`)
-                    core.info(`\t==> ID: ${artifact.id}`)
-                    core.info(`\t==> Name: ${artifact.name}`)
-                    core.info(`\t==> Size: ${size}`)
-                }
-                return
+            const found = artifacts.length > 0
+            core.setOutput("found_artifact", found)
+            if (!found) return
+            core.info('==> (found) Artifacts')
+            for (const artifact of artifacts) {
+                core.info(`\t==> Artifact:`)
+                core.info(`\t==> ID: ${artifact.id}`)
+                core.info(`\t==> Name: ${artifact.name}`)
+                core.info(`\t==> Size: ${artifact.size_in_bytes} bytes`)
             }
+            return
         }
 
         if (artifacts.length == 0) {
             return setExitMessage(ifNoArtifactFound, "no artifacts found")
         }
 
-        core.setOutput("found_artifact", true)
+        const expiredArtifacts = []
 
         for (const artifact of artifacts) {
             core.info(`==> Artifact: ${artifact.id}`)
 
-            const size = filesize(artifact.size_in_bytes, { base: 10 })
+            core.info(`==> Downloading: ${artifact.name} (${artifact.size_in_bytes} bytes)`)
 
-            core.info(`==> Downloading: ${artifact.name}.zip (${size})`)
+            if (artifact.expired) {
+                if (ifNoArtifactFound === "fail") {
+                    return setExitMessage(ifNoArtifactFound, "no downloadable artifacts found (expired)")
+                }
+                expiredArtifacts.push(artifact.name)
+                continue
+            }
 
-            let zip
+            const dir = skipUnpack || (name && (!nameIsRegExp || mergeMultiple))
+                ? path
+                : pathname.join(path, artifact.name)
+
+            if (canStreamArtifacts) {
+                let response
+                try {
+                    response = await artifactClient.downloadArtifact(artifact.id, {
+                        path: dir,
+                        skipDecompress: skipUnpack || useUnzip,
+                        ...(artifact.digest ? { expectedHash: artifact.digest } : {}),
+                        findBy: {
+                            token: token,
+                            workflowRunId: Number(runID),
+                            repositoryOwner: owner,
+                            repositoryName: repo,
+                        },
+                    })
+                } catch (error) {
+                    if (error.message.includes("Artifact has expired")) {
+                        if (ifNoArtifactFound === "fail") {
+                            return setExitMessage(ifNoArtifactFound, "no downloadable artifacts found (expired)")
+                        }
+                        expiredArtifacts.push(artifact.name)
+                        continue
+                    }
+                    throw error
+                }
+
+                if (response.digestMismatch) {
+                    throw new Error(`artifact digest mismatch: ${artifact.name}`)
+                }
+
+                const zipPath = pathname.join(dir, `${artifact.name}.zip`)
+                if (useUnzip && !skipUnpack && fs.existsSync(zipPath)) {
+                    core.startGroup(`==> Extracting: ${artifact.name}.zip`)
+                    try {
+                        await exec.exec("unzip", [zipPath, "-d", dir])
+                    } finally {
+                        core.endGroup()
+                    }
+                    fs.rmSync(zipPath)
+                }
+                continue
+            }
+
+            fs.mkdirSync(dir, { recursive: true })
+            const zipPath = pathname.join(dir, `.artifact-${randomUUID()}.zip`)
+
             try {
-                zip = await client.rest.actions.downloadArtifact({
+                await client.request("GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}/{archive_format}", {
                     owner: owner,
                     repo: repo,
                     artifact_id: artifact.id,
                     archive_format: "zip",
+                    request: {
+                        fetch: async (url, options) => {
+                            const response = await githubDefaults.request.fetch(url, { ...options, redirect: "follow" })
+                            if (!response.ok) return response
+                            await pipeline(response.body, fs.createWriteStream(zipPath))
+                            return new Response(null, { status: 200, headers: response.headers })
+                        },
+                    },
                 })
             } catch (error) {
-                if (error.message.startsWith("Artifact has expired")) {
-                    return setExitMessage(ifNoArtifactFound, "no downloadable artifacts found (expired)")
-                } else {
-                    throw new Error(error.message)
+                fs.rmSync(zipPath, { force: true })
+                if (error.message?.startsWith("Artifact has expired")) {
+                    if (ifNoArtifactFound === "fail") {
+                        return setExitMessage(ifNoArtifactFound, "no downloadable artifacts found (expired)")
+                    }
+                    expiredArtifacts.push(artifact.name)
+                    continue
                 }
+                throw error
             }
 
             if (skipUnpack) {
-                fs.mkdirSync(path, { recursive: true })
-                fs.writeFileSync(`${pathname.join(path, artifact.name)}.zip`, Buffer.from(zip.data), 'binary')
+                try {
+                    fs.renameSync(zipPath, `${pathname.join(path, artifact.name)}.zip`)
+                } finally {
+                    fs.rmSync(zipPath, { force: true })
+                }
                 continue
             }
 
-            const dir = name && (!nameIsRegExp || mergeMultiple) ? path : pathname.join(path, artifact.name)
-
-            fs.mkdirSync(dir, { recursive: true })
-
-            core.startGroup(`==> Extracting: ${artifact.name}.zip`)
-            if (useUnzip) {
-                const zipPath = `${pathname.join(dir, artifact.name)}.zip`
-                fs.writeFileSync(zipPath, Buffer.from(zip.data), 'binary')
-                await exec.exec("unzip", [zipPath, "-d", dir])
-                fs.rmSync(zipPath)
-            } else {
-                const adm = new AdmZip(Buffer.from(zip.data))
-                adm.getEntries().forEach((entry) => {
-                    const action = entry.isDirectory ? "creating" : "inflating"
-                    const filepath = pathname.join(dir, entry.entryName)
-
-                    core.info(`  ${action}: ${filepath}`)
-                })
-                adm.extractAllTo(dir, true)
+            try {
+                core.startGroup(`==> Extracting: ${artifact.name}.zip`)
+                try {
+                    if (useUnzip) {
+                        await exec.exec("unzip", [zipPath, "-d", dir])
+                    } else {
+                        new AdmZip(zipPath).extractAllTo(dir, true)
+                    }
+                } finally {
+                    core.endGroup()
+                }
+            } finally {
+                fs.rmSync(zipPath, { force: true })
             }
-            core.endGroup()
         }
+
+        if (expiredArtifacts.length === artifacts.length) {
+            return setExitMessage(ifNoArtifactFound, "no downloadable artifacts found (expired)")
+        }
+
+        if (expiredArtifacts.length > 0) {
+            const message = `skipped expired artifact${expiredArtifacts.length === 1 ? "" : "s"}: ${expiredArtifacts.join(", ")}`
+            if (ifNoArtifactFound === "warn") core.warning(message)
+            else core.info(message)
+        }
+
+        core.setOutput("found_artifact", true)
     } catch (error) {
         core.setOutput("found_artifact", false)
         core.setOutput("error_message", error.message)
@@ -318,19 +344,9 @@ async function main() {
 
     function setExitMessage(ifNoArtifactFound, message) {
         core.setOutput("found_artifact", false)
-
-        switch (ifNoArtifactFound) {
-            case "fail":
-                core.setFailed(message)
-                break
-            case "warn":
-                core.warning(message)
-                break
-            case "ignore":
-            default:
-                core.info(message)
-                break
-        }
+        if (ifNoArtifactFound === "fail") return core.setFailed(message)
+        if (ifNoArtifactFound === "warn") return core.warning(message)
+        core.info(message)
     }
 }
 
