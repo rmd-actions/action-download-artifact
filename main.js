@@ -33,7 +33,7 @@ async function main() {
         let checkArtifacts = core.getBooleanInput("check_artifacts")
         let searchArtifacts = core.getBooleanInput("search_artifacts")
         const allowForks = core.getBooleanInput("allow_forks")
-        let dryRun = core.getInput("dry_run")
+        let dryRun = core.getBooleanInput("dry_run")
 
         const client = github.getOctokit(token)
         const artifactClient = new artifact.DefaultArtifactClient()
@@ -114,19 +114,44 @@ async function main() {
 
         if (!runID) {
             const runGetter = workflow ? client.rest.actions.listWorkflowRuns : client.rest.actions.listWorkflowRunsForRepo
-            // Note that the runs are returned in most recent first order.
+            // Filtered queries are served by a search index that intermittently returns a random subset of runs,
+            // so merge in the latest unfiltered runs, matched locally. Only helps if the newest match is among them.
+            let latestRuns = []
+            if (branch || event || commit) {
+                latestRuns = (await runGetter({
+                    owner: owner,
+                    repo: repo,
+                    per_page: 100,
+                    ...(workflow ? { workflow_id: workflow } : {}),
+                })).data.workflow_runs.filter(run =>
+                    (!branch || run.head_branch === branch) &&
+                    (!event || run.event === event) &&
+                    (!commit || run.head_sha === commit)
+                )
+            }
             for await (const runs of client.paginate.iterator(runGetter, {
                 owner: owner,
                 repo: repo,
+                per_page: 100,
                 ...(workflow ? { workflow_id: workflow } : {}),
                 ...(branch ? { branch } : {}),
                 ...(event ? { event } : {}),
                 ...(commit ? { head_sha: commit } : {}),
-                ...(workflowConclusion ? { status: workflowConclusion } : {}),
             }
             )) {
-                for (const run of runs.data) {
+                core.debug(`==> Fetched page of ${runs.data.length} runs: ${runs.data.map(run => run.id).join(", ")}`)
+                const missingRuns = latestRuns.filter(run => !runs.data.some(r => r.id === run.id))
+                if (missingRuns.length) {
+                    core.debug(`==> Merging runs missing from filtered page: ${missingRuns.map(run => run.id).join(", ")}`)
+                }
+                latestRuns = []
+                // Do not rely on the API returning runs in most recent first order, it sometimes does not.
+                for (const run of [...runs.data, ...missingRuns].sort((a, b) => b.id - a.id)) {
                     if (runNumber && run.run_number != runNumber) {
+                        continue
+                    }
+                    if (workflowConclusion && workflowConclusion != run.conclusion && workflowConclusion != run.status) {
+                        core.debug(`==> Skipping run ${run.id} (${run.created_at}): status ${run.status}, conclusion ${run.conclusion}`)
                         continue
                     }
                     if (!allowForks && run.head_repository.full_name !== `${owner}/${repo}`) {
@@ -134,12 +159,15 @@ async function main() {
                         continue
                     }
                     if (checkArtifacts || searchArtifacts) {
-                        const artifacts = await client.paginate(client.rest.actions.listWorkflowRunArtifacts, {
+                        const artifacts = (await client.paginate(client.rest.actions.listWorkflowRunArtifacts, {
                             owner: owner,
                             repo: repo,
                             run_id: run.id,
-                        })
-                        if (artifacts.length === 0 || (searchArtifacts && !artifacts.some(matchesName))) continue
+                        })).filter(artifact => !artifact.expired)
+                        if (artifacts.length === 0 || (searchArtifacts && !artifacts.some(matchesName))) {
+                            core.debug(`==> Skipping run ${run.id} (${run.created_at}): artifacts [${artifacts.map(artifact => artifact.name).join(", ")}]`)
+                            continue
+                        }
                     }
 
                     runID = run.id
